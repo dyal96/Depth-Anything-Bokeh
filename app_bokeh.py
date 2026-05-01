@@ -8,6 +8,16 @@ import subprocess
 from PIL import Image
 from depth_anything_v2.dpt import DepthAnythingV2
 
+try:
+    from mobile_sam import sam_model_registry, SamPredictor
+except ImportError:
+    pass
+
+try:
+    from ultralytics import YOLO
+except ImportError:
+    pass
+
 css = """
 #img-display-container {
     max-height: 100vh;
@@ -23,9 +33,11 @@ model_configs = {
     'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
 }
 
-# Global state for caching the model
+# Global state for caching the models
 current_encoder = None
 model = None
+sam_predictor = None
+yolo_model = None
 
 def get_encoder_from_choice(choice):
     if "Fast" in choice: return "vits"
@@ -49,9 +61,70 @@ def load_model(encoder):
         print("Model loaded successfully.")
     return model
 
-def apply_bokeh(image, depth, focal_point=0.5, max_blur_size=15, invert_depth=False):
+def load_sam():
+    global sam_predictor
+    if sam_predictor is None:
+        print("Loading MobileSAM...")
+        try:
+            model_type = "vit_t"
+            sam_checkpoint = "checkpoints/mobile_sam.pt"
+            mobile_sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+            mobile_sam.to(device=DEVICE)
+            mobile_sam.eval()
+            sam_predictor = SamPredictor(mobile_sam)
+            print("MobileSAM loaded.")
+        except Exception as e:
+            raise gr.Error(f"Failed to load MobileSAM: {str(e)}. Make sure it's installed and weights are in checkpoints/")
+    return sam_predictor
+
+def load_yolo():
+    global yolo_model
+    if yolo_model is None:
+        print(f"Loading YOLOv8-seg...")
+        try:
+            # Use the smallest segment model for speed
+            yolo_model = YOLO('checkpoints/yolov8n-seg.pt')
+            print("YOLOv8-seg loaded.")
+        except Exception as e:
+            print(f"Failed to load YOLO: {str(e)}")
+            return None
+    return yolo_model
+
+def get_auto_person_mask(image):
+    detector = load_yolo()
+    if detector is None:
+        return None
+        
+    try:
+        # Pass device to predict call
+        results = detector(image, verbose=False, device=DEVICE)
+    except Exception as e:
+        print(f"YOLO inference failed: {str(e)}")
+        return None
+    
+    # Person class is usually 0 in COCO
+    person_id = 0
+    
+    full_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+    
+    for result in results:
+        if result.masks is not None:
+            # results.masks.data can be on GPU, move to CPU
+            masks = result.masks.data.cpu().numpy()
+            classes = result.boxes.cls.cpu().numpy()
+            
+            for i, cls in enumerate(classes):
+                if int(cls) == person_id:
+                    mask = masks[i]
+                    # Resize mask to original image size
+                    mask = cv2.resize(mask, (image.shape[1], image.shape[0]))
+                    full_mask = np.logical_or(full_mask, mask > 0.5)
+                    
+    return full_mask.astype(np.uint8)
+
+def apply_bokeh(image, depth, focal_point=0.5, max_blur_size=15, invert_depth=False, mask=None):
     """
-    Applies a depth-of-field (bokeh) effect to an image based on a depth map.
+    Applies a depth-of-field (bokeh) effect to an image based on a depth map and optional segmentation mask.
     """
     # Normalize depth to 0.0 - 1.0
     depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-6)
@@ -59,7 +132,13 @@ def apply_bokeh(image, depth, focal_point=0.5, max_blur_size=15, invert_depth=Fa
     if invert_depth:
         depth_norm = 1.0 - depth_norm
         
+    # Calculate absolute distance from focal point (0.0 to 1.0)
     blur_amount = np.abs(depth_norm - focal_point)
+    
+    # If we have a segmentation mask, set blur_amount to 0 for the subject
+    if mask is not None:
+        blur_amount[mask > 0] = 0
+    
     levels = 10
     blurred_images = []
     max_k = int(max_blur_size) * 2 + 1
@@ -94,11 +173,17 @@ def apply_bokeh(image, depth, focal_point=0.5, max_blur_size=15, invert_depth=Fa
             
     return np.clip(result, 0, 255).astype(np.uint8)
 
-def process_image(image, model_choice, focal_point, blur_size, invert_depth):
+def process_image(image, model_choice, focal_point, blur_size, invert_depth, auto_focus_person, seg_mask=None):
     if image is None:
         return None, None, None
         
-    # Ensure model is loaded
+    if auto_focus_person:
+        auto_mask = get_auto_person_mask(image)
+        if seg_mask is not None:
+            seg_mask = np.logical_or(seg_mask > 0, auto_mask > 0).astype(np.uint8)
+        else:
+            seg_mask = auto_mask
+        
     encoder = get_encoder_from_choice(model_choice)
     loaded_model = load_model(encoder)
         
@@ -111,7 +196,7 @@ def process_image(image, model_choice, focal_point, blur_size, invert_depth):
     cmap = matplotlib.colormaps.get_cmap('Spectral_r')
     colored_depth = (cmap(depth_vis)[:, :, :3] * 255).astype(np.uint8)
     
-    bokeh_image = apply_bokeh(image, depth, focal_point=focal_point, max_blur_size=blur_size, invert_depth=invert_depth)
+    bokeh_image = apply_bokeh(image, depth, focal_point=focal_point, max_blur_size=blur_size, invert_depth=invert_depth, mask=seg_mask)
     
     gray_depth = Image.fromarray(depth_vis)
     tmp_gray_depth = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
@@ -119,11 +204,36 @@ def process_image(image, model_choice, focal_point, blur_size, invert_depth):
     
     return bokeh_image, colored_depth, tmp_gray_depth.name
 
-def process_video(video_path, model_choice, focal_point, blur_size, invert_depth, progress=gr.Progress()):
+def get_sam_mask(image, evt: gr.SelectData):
+    if image is None:
+        return None, None
+    
+    predictor = load_sam()
+    predictor.set_image(image)
+    
+    # evt.index gives [x, y]
+    input_point = np.array([[evt.index[0], evt.index[1]]])
+    input_label = np.array([1])
+    
+    masks, scores, logits = predictor.predict(
+        point_coords=input_point,
+        point_labels=input_label,
+        multimask_output=True,
+    )
+    
+    # Use the mask with highest score
+    mask = masks[np.argmax(scores)]
+    
+    # Create an overlay for visualization
+    overlay = image.copy()
+    overlay[mask > 0] = overlay[mask > 0] * 0.5 + np.array([0, 255, 0]) * 0.5
+    
+    return mask, overlay
+
+def process_video(video_path, model_choice, focal_point, blur_size, invert_depth, auto_focus_person, progress=gr.Progress()):
     if not video_path:
         return None
         
-    # Ensure model is loaded
     encoder = get_encoder_from_choice(model_choice)
     loaded_model = load_model(encoder)
     
@@ -147,7 +257,13 @@ def process_video(video_path, model_choice, focal_point, blur_size, invert_depth
         progress(frame_idx / total_frames, desc=f"Processing Frame {frame_idx}/{total_frames}")
         
         depth = loaded_model.infer_image(raw_frame)
-        bokeh_frame = apply_bokeh(raw_frame, depth, focal_point=focal_point, max_blur_size=blur_size, invert_depth=invert_depth)
+        
+        # Apply auto person focus if enabled
+        mask = None
+        if auto_focus_person:
+            mask = get_auto_person_mask(raw_frame)
+            
+        bokeh_frame = apply_bokeh(raw_frame, depth, focal_point=focal_point, max_blur_size=blur_size, invert_depth=invert_depth, mask=mask)
         
         out.write(bokeh_frame)
         frame_idx += 1
@@ -177,7 +293,9 @@ def process_video(video_path, model_choice, focal_point, blur_size, invert_depth
 
 with gr.Blocks(css=css, title="Depth-Anything-V2 Bokeh Generator") as demo:
     gr.Markdown("# 📷 Depth-of-Field (Bokeh) Generator")
-    gr.Markdown("Add realistic, fake blur to your photos and videos using the **Depth-Anything-V2** model.")
+    gr.Markdown("Add realistic, fake blur to your photos and videos. Now with **MobileSAM** segmentation support!")
+    
+    current_mask = gr.State(None)
     
     with gr.Row():
         model_selection = gr.Radio(
@@ -191,24 +309,33 @@ with gr.Blocks(css=css, title="Depth-Anything-V2 Bokeh Generator") as demo:
         with gr.Tab("Photo Processing"):
             with gr.Row():
                 with gr.Column():
-                    photo_input = gr.Image(label="Input Image", type='numpy')
+                    photo_input = gr.Image(label="Input Image (Click to select subject for perfect focus)", type='numpy')
                     
                     with gr.Group():
                         gr.Markdown("### ⚙️ Adjustments")
                         p_focal_point = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05, label="Focal Point (0.0 to 1.0)")
                         p_blur_size = gr.Slider(minimum=1, maximum=50, value=15, step=1, label="Blur Intensity")
                         p_invert_depth = gr.Checkbox(label="Invert Depth Map", value=False)
+                        p_auto_person = gr.Checkbox(label="Auto-Focus Persons (Keep people sharp)", value=True)
                         
-                    photo_submit = gr.Button("Generate Bokeh", variant="primary")
+                    with gr.Row():
+                        photo_submit = gr.Button("Generate Bokeh", variant="primary")
+                        clear_seg = gr.Button("Clear Selection")
                     
                 with gr.Column():
                     photo_output = gr.Image(label="Result with Bokeh", type='numpy', format="jpeg")
-                    photo_depth_vis = gr.Image(label="Generated Depth Map", type='numpy')
+                    photo_depth_vis = gr.Image(label="Generated Depth Map / Selection Preview", type='numpy')
                     photo_depth_dl = gr.File(label="Download Grayscale Depth Map (PNG)")
+
+            def reset_seg():
+                return None, None
+
+            photo_input.select(get_sam_mask, inputs=[photo_input], outputs=[current_mask, photo_depth_vis])
+            clear_seg.click(reset_seg, outputs=[current_mask, photo_depth_vis])
 
             photo_submit.click(
                 fn=process_image,
-                inputs=[photo_input, model_selection, p_focal_point, p_blur_size, p_invert_depth],
+                inputs=[photo_input, model_selection, p_focal_point, p_blur_size, p_invert_depth, p_auto_person, current_mask],
                 outputs=[photo_output, photo_depth_vis, photo_depth_dl]
             )
 
@@ -223,6 +350,7 @@ with gr.Blocks(css=css, title="Depth-Anything-V2 Bokeh Generator") as demo:
                         v_focal_point = gr.Slider(minimum=0.0, maximum=1.0, value=0.5, step=0.05, label="Focal Point (0.0 to 1.0)")
                         v_blur_size = gr.Slider(minimum=1, maximum=50, value=15, step=1, label="Blur Intensity")
                         v_invert_depth = gr.Checkbox(label="Invert Depth Map", value=False)
+                        v_auto_person = gr.Checkbox(label="Auto-Focus Persons (Keep people sharp)", value=True)
                         
                     video_submit = gr.Button("Generate Video Bokeh", variant="primary")
                     
@@ -231,15 +359,13 @@ with gr.Blocks(css=css, title="Depth-Anything-V2 Bokeh Generator") as demo:
 
             video_submit.click(
                 fn=process_video,
-                inputs=[video_input, model_selection, v_focal_point, v_blur_size, v_invert_depth],
+                inputs=[video_input, model_selection, v_focal_point, v_blur_size, v_invert_depth, v_auto_person],
                 outputs=[video_output]
             )
 
 if __name__ == '__main__':
-    # Initialize the default model before launching
     load_model("vitl")
     
-    # Enable public link if running in Google Colab
     import os
     share_gradio = "COLAB_RELEASE_TAG" in os.environ
     

@@ -12,6 +12,7 @@ source venv/bin/activate
 echo "Installing dependencies..."
 pip install -r requirements.txt
 pip install xformers
+pip install git+https://github.com/ChaoningZhang/MobileSAM.git
 
 if [ ! -d "checkpoints" ]; then
     mkdir checkpoints
@@ -42,6 +43,20 @@ if [ ! -f "checkpoints/depth_anything_v2_vitl.pth" ]; then
     curl -L -o checkpoints/depth_anything_v2_vitl.pth https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth
 else
     echo "vitl checkpoint already exists."
+fi
+
+if [ ! -f "checkpoints/mobile_sam.pt" ]; then
+    echo "Downloading MobileSAM weights ~40MB..."
+    curl -L -o checkpoints/mobile_sam.pt https://github.com/ChaoningZhang/MobileSAM/raw/master/weights/mobile_sam.pt
+else
+    echo "mobile_sam.pt already exists."
+fi
+
+if [ ! -f "checkpoints/yolov8n-seg.pt" ]; then
+    echo "Downloading YOLOv8-seg weights ~7MB..."
+    curl -L -o checkpoints/yolov8n-seg.pt https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n-seg.pt
+else
+    echo "yolov8n-seg.pt already exists."
 fi
 
 echo ""

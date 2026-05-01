@@ -6,6 +6,7 @@ This standalone application was customized to allow quick, interactive depth-bas
 
 ## Features
 - **Interactive UI**: Upload images/videos and adjust the focal point and blur intensity on the fly.
+- **Smart Segmentation**: Click on any subject in a photo to keep it in perfect focus using **MobileSAM**.
 - **Model Selection**: Switch between Fast (vits), Base (vitb), and High Quality (vitl) Depth-Anything-V2 models directly within the UI.
 - **Video Support**: Automatically extracts video frames, applies the depth blur, and uses `ffmpeg` to stitch everything back together with the original audio.
 - **Depth Map Export**: Easily download the raw grayscale depth map of your photos.
